@@ -250,3 +250,62 @@ incident-retrieval-repair/
 ├── README.md                      ← this file — update with your decisions
 └── package.json                   ← npm scripts — do not edit
 ```
+
+---
+
+## Retrieval-Model Decisions
+
+### Decision 1: Embeddings are stored per chunk as `vector(1536) NOT NULL`
+Spec said: the "similar past incidents" feature ranks incident text by vector similarity, and long, multi-paragraph descriptions must be split into chunks that each carry their own vector.
+Schema decided: `incident_chunks.embedding vector(1536) NOT NULL` (pgvector), with an HNSW index `idx_incident_chunks_embedding ... USING hnsw (embedding vector_cosine_ops)`. `chunk_text` is `NOT NULL` so every vector has its source text.
+Reason: only a native `vector` column supports the `<=>` cosine-distance operator and an ANN index. A `TEXT` column cannot be compared or indexed for similarity, so every query would be a full scan that parses strings. HNSW is chosen over an exact scan because top-3 retrieval tolerates approximate results in exchange for fast lookups.
+
+### Decision 2: `incident_chunks.incident_id` is `BIGINT NOT NULL ... ON DELETE CASCADE`
+Spec said: a chunk has no meaning without the incident it came from.
+Schema decided: `incident_id BIGINT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE`, `id BIGSERIAL`, and a B-tree index `idx_incident_chunks_incident_id`.
+Reason: `incidents.id` is `BIGSERIAL`, so the FK must be `BIGINT` to match (an `INTEGER` FK would overflow before its parent key does). `NOT NULL` forbids orphan chunks, and `CASCADE` means deleting an incident cannot leave behind embeddings that still surface in search. Postgres does not index FK columns automatically, so the B-tree index keeps "all chunks for an incident" lookups and cascade deletes from scanning the whole table.
+
+### Decision 3: `team_id` and `severity` are denormalised onto each chunk
+Spec said: retrieval is filtered by team and severity alongside the similarity ranking.
+Schema decided: `team_id BIGINT NOT NULL` and `severity TEXT NOT NULL` are copied onto `incident_chunks`, and `created_at` is `TIMESTAMPTZ NOT NULL DEFAULT now()`.
+Reason: the vector search can apply the filters directly on `incident_chunks` without joining back to `incidents` for every candidate. This is an access-pattern-driven duplication, accepted deliberately. The cost is that the copies must be kept in sync if an incident's team or severity changes. `TIMESTAMPTZ` is used so timestamps are unambiguous across time zones.
+
+## Rejected Shape
+
+### Shape: a single `embedding` column on `incidents`
+What it was: `ALTER TABLE incidents ADD COLUMN embedding TEXT;`, one embedding per incident.
+Why rejected: an incident's description is long and multi-paragraph, and one vector cannot represent all of it well. Embedding models also have input limits, so long text would be truncated or blurred into a single point. The column was also typed `TEXT`, which cannot be indexed or compared as a vector.
+What would break: similarity search would match only a vague summary of each incident, so relevant details deep in a description would never be found. There would be no way to point to the passage that matched, and no per-chunk team/severity filtering. It has been removed; embeddings live only in `incident_chunks`, one-to-many from `incidents`.
+
+---
+
+## Test Results
+
+`npm test` (`pg_prove -d incident_retrieval_test tests/schema.test.sql`) after `npm run db:reset`, on PostgreSQL 18 with pgvector 0.8.1 and pgTAP:
+
+```
+1..20
+ok 1 - incidents table exists
+ok 2 - incident_chunks table exists
+ok 3 - incident_chunks.id is BIGINT (BIGSERIAL)
+ok 4 - incident_chunks.incident_id is BIGINT FK
+ok 5 - incident_chunks.chunk_text is TEXT
+ok 6 - incident_chunks.embedding is vector(1536) not TEXT
+ok 7 - incident_chunks.team_id filter metadata exists as BIGINT
+ok 8 - incident_chunks.severity filter metadata exists as TEXT
+ok 9 - incident_chunks.created_at is TIMESTAMPTZ
+ok 10 - incident_id is NOT NULL
+ok 11 - chunk_text is NOT NULL
+ok 12 - embedding is NOT NULL
+ok 13 - team_id is NOT NULL
+ok 14 - severity is NOT NULL
+ok 15 - created_at is NOT NULL
+ok 16 - incident_chunks.incident_id references incidents.id
+ok 17 - ANN vector index on embedding exists
+ok 18 - B-tree index on incident_id exists
+ok 19 - rejected single embedding column on incidents must be removed
+ok 20 - deleting an incident cascades and removes its chunks (ON DELETE CASCADE)
+All tests successful.
+Files=1, Tests=20
+Result: PASS
+```
